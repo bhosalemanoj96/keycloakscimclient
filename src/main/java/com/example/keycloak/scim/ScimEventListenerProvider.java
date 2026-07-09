@@ -210,16 +210,20 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         ScimSyncService syncService = ScimClientCache.getOrCreate(realm, serverDefaultConfig);
         String attr = serverDefaultConfig.overrideFromRealm(realm).externalIdAttribute();
         String existingScimId = ExternalIdStore.getGroupExternalId(group, attr);
-        Group scimGroup = ScimGroupMapper.toScimGroup(group);
 
         if (existingScimId == null) {
+            Group scimGroup = ScimGroupMapper.toScimGroup(group);
             String newId = syncService.createGroup(scimGroup);
             if (newId != null) {
                 ExternalIdStore.setGroupExternalId(group, attr, newId);
             }
             return newId;
         } else {
-            syncService.updateGroup(existingScimId, scimGroup);
+            // PATCH only displayName here, not a full PUT: ScimGroupMapper doesn't populate
+            // "members" (membership is synced independently via addMember/removeMember below), so
+            // a PUT would send an empty members field and wipe real membership as a side effect of
+            // something as simple as a group rename.
+            syncService.renameGroup(existingScimId, group.getName());
             return existingScimId;
         }
     }

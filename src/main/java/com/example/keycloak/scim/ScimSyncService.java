@@ -36,9 +36,53 @@ public class ScimSyncService {
                 scimRequestBuilder.create(User.class, EndpointPaths.USERS)
                         .setResource(scimUser)
                         .sendRequest());
-        return handle(response, "create user " + scimUser.getUserName().orElse("?"))
-                ? response.getResource().getId().orElse(null)
-                : null;
+
+        if (handle(response, "create user " + scimUser.getUserName().orElse("?"))) {
+            return response.getResource().getId().orElse(null);
+        }
+
+        // Reconcile a 409 instead of just failing. Root cause we actually hit in practice: our own
+        // retry can resend a POST after a timeout where the *first* attempt's request actually
+        // reached the server and succeeded but the response was lost — the retry then correctly
+        // gets a 409 for a resource that really does exist, createUser() returns null, and the
+        // Keycloak user never gets its scimExternalId recorded even though the SCIM server has a
+        // real record. Left unhandled, every future sync for that user 409s forever. Look the
+        // existing resource up by userName and adopt its id instead of leaving it orphaned.
+        if (response.getHttpStatus() == 409) {
+            String userName = scimUser.getUserName().orElse(null);
+            if (userName != null) {
+                String existingId = findUserIdByUserName(userName);
+                if (existingId != null) {
+                    LOG.infof("Reconciled 409 conflict for user %s with existing SCIM id %s", userName, existingId);
+                    return existingId;
+                }
+                LOG.errorf("409 conflict for user %s but lookup-by-userName found no match; leaving unresolved", userName);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * NOTE: exact list/search API shape (method/type names) is unverified against your installed
+     * scim-sdk-client 1.32.0 — I don't have confirmed source for the list/query builder the way I
+     * do for create/update/delete/patch. If this doesn't compile, the fix is almost certainly just
+     * renaming a method/type here (same pattern as the BasicAuth package / httpClientBuilder fixes
+     * earlier) — paste the compiler error and I'll correct it.
+     */
+    private String findUserIdByUserName(String userName) {
+        try {
+            var response = scimRequestBuilder.list(User.class, EndpointPaths.USERS)
+                    .filter("userName eq \"" + userName + "\"")
+                    .get()
+                    .sendRequest();
+            if (response.isSuccess() && response.getResource() != null
+                    && !response.getResource().getListedResources().isEmpty()) {
+                return response.getResource().getListedResources().get(0).getId().orElse(null);
+            }
+        } catch (Exception e) {
+            LOG.warnf("Failed to look up existing SCIM user by userName=%s: %s", userName, e.getMessage());
+        }
+        return null;
     }
 
     public boolean updateUser(String scimUserId, User scimUser) {
@@ -67,12 +111,34 @@ public class ScimSyncService {
                 : null;
     }
 
+    /**
+     * Full-resource replace (PUT). CAUTION: SCIM PUT replaces the entire resource — any field this
+     * extension doesn't populate on the Group object (notably "members", since ScimGroupMapper only
+     * sets displayName/externalId) will be sent as empty/absent, which a compliant SCIM server will
+     * interpret as "clear it". Do NOT use this for a simple rename; use {@link #renameGroup} instead,
+     * which only touches displayName via PATCH and leaves membership (managed separately via
+     * addMember/removeMember) untouched. Kept here for cases where you really do want a full
+     * resource replace with a fully-populated Group object.
+     */
     public boolean updateGroup(String scimGroupId, Group scimGroup) {
         ServerResponse<Group> response = withRetry(() ->
                 scimRequestBuilder.update(Group.class, EndpointPaths.GROUPS, scimGroupId)
                         .setResource(scimGroup)
                         .sendRequest());
         return handle(response, "update group " + scimGroupId);
+    }
+
+    /** PATCH-only displayName update — does not touch membership. This is what group renames use. */
+    public boolean renameGroup(String scimGroupId, String newDisplayName) {
+        ServerResponse<Group> response = withRetry(() ->
+                scimRequestBuilder.patch(Group.class, EndpointPaths.GROUPS, scimGroupId)
+                        .addOperation()
+                        .path("displayName")
+                        .op(PatchOp.REPLACE)
+                        .valueNode(newDisplayName)
+                        .build()
+                        .sendRequest());
+        return handle(response, "rename group " + scimGroupId);
     }
 
     public boolean deleteGroup(String scimGroupId) {

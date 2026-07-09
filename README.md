@@ -13,7 +13,7 @@ Azure AD.
 | Update user (profile, enable/disable, name, email)  | AdminEvent / Event (UPDATE_PROFILE) | `PUT /Users/{id}`                |
 | Delete user                                         | `UserModel.UserRemovedEvent`      | `DELETE /Users/{id}`               |
 | Create group                                        | AdminEvent                       | `POST /Groups`                     |
-| Update group (rename)                               | AdminEvent                       | `PUT /Groups/{id}`                 |
+| Update group (rename)                               | AdminEvent                       | `PATCH /Groups/{id}` (displayName only) |
 | Delete group                                        | `GroupModel.GroupRemovedEvent`   | `DELETE /Groups/{id}`              |
 | User joins group                                    | AdminEvent (GROUP_MEMBERSHIP, CREATE) | `PATCH /Groups/{id}` (add member) |
 | User leaves group                                   | AdminEvent (GROUP_MEMBERSHIP, DELETE) | `PATCH /Groups/{id}` (remove member) |
@@ -130,6 +130,42 @@ Worth still running once to be sure there's only one version now:
 ```cmd
 mvn dependency:tree | findstr scim-sdk
 ```
+
+## Known issue fixed: a lost create response could orphan a user forever
+
+Diagnosed from a real repeated 409 in testing: `createUser` POSTs, the SCIM server actually creates
+the user and returns success, but the response is lost client-side (network hiccup, or a paused
+debugger blowing past the request timeout). Our own retry logic then resends the POST, which
+correctly 409s since the user now really exists — but `createUser()` still returned `null` overall,
+so the Keycloak user never got its `scimExternalId` recorded. Every future sync for that user then
+kept hitting the same 409 forever, since Keycloak had no record of the SCIM side already having it.
+
+Fixed by reconciling on 409: `createUser` now looks the existing resource up by `userName` and
+adopts its id instead of giving up. This is self-healing for existing orphaned records too — you
+should **not** need to manually clean up already-affected users on the SCIM server; the next sync
+attempt for them will 409, look them up, and adopt the existing id automatically.
+
+**Caveat:** the lookup (`findUserIdByUserName`) uses a list/filter query
+(`scimRequestBuilder.list(User.class, ...).filter("userName eq \"...\"").get()...`) whose exact
+method/type shape I could not verify against your installed `scim-sdk-client` 1.32.0 the way I did
+for create/update/delete/patch earlier — this is the least-confident part of this change. If it
+doesn't compile, it's almost certainly just a method/type rename, same as the `BasicAuth`
+package/`httpClientBuilder` fixes earlier.
+
+## Known issue fixed: group updates were wiping group membership
+
+`ScimGroupMapper.toScimGroup(GroupModel)` never populated a `members` field — membership was always
+meant to be synced separately via the dedicated `addMember`/`removeMember` PATCH calls. But group
+*updates* (e.g. a simple rename) went through `updateGroup(...)`, which issues a SCIM **PUT** — and
+per RFC 7644, PUT is a full-resource replace. Since the mapped `Group` object never carried
+members, every PUT sent an empty/absent `members` field, which a compliant SCIM server correctly
+interprets as "clear membership." Fixed by adding `ScimSyncService.renameGroup(...)`, a PATCH that
+touches only `displayName`, and switching the event listener's update path to use it instead of the
+full PUT. `updateGroup` (PUT) is still available in `ScimSyncService` for cases where you actually
+want a full resource replace with a fully-populated `Group` object — just don't use it for anything
+partial. The same PUT-is-a-full-replace caveat is worth keeping in mind if you ever extend
+`ScimUserMapper`/`updateUser` with additional fields later — anything the mapper doesn't populate
+gets cleared on PUT, not left alone.
 
 ## Known issue fixed: UI-saved config didn't survive a server restart
 
