@@ -1,5 +1,6 @@
 package com.example.keycloak.scim;
 
+import com.fasterxml.jackson.databind.node.TextNode;
 import de.captaingoldfish.scim.sdk.client.ScimRequestBuilder;
 import de.captaingoldfish.scim.sdk.client.response.ServerResponse;
 import de.captaingoldfish.scim.sdk.common.constants.EndpointPaths;
@@ -135,7 +136,7 @@ public class ScimSyncService {
                         .addOperation()
                         .path("displayName")
                         .op(PatchOp.REPLACE)
-                        .valueNode(newDisplayName)
+                        .valueNode(TextNode.valueOf(newDisplayName))
                         .build()
                         .sendRequest());
         return handle(response, "rename group " + scimGroupId);
