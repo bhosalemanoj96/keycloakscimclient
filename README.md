@@ -131,25 +131,41 @@ Worth still running once to be sure there's only one version now:
 mvn dependency:tree | findstr scim-sdk
 ```
 
-## Known gap fixed (partially): nested/child groups weren't synced at all
+## Known issue fixed: removing a user from a group (and un-nesting a child group) did nothing
 
-Confirmed from real logs: moving a group to become a child of another (or creating a new child
-group) fires `resourceType=GROUP`, `resourcePath=groups/{parentId}/children`,
-`operationType=UPDATE` — a shape the original regex (`^groups/([^/]+)$`) never matched, so these
-events were silently falling through unhandled. Added detection for this path plus
-`syncGroupChildren(...)`, which ensures the parent and each current child are synced, then adds
-each child as a `Group`-typed member on the parent's SCIM group (RFC 7643's standard mechanism for
-representing nested groups).
+Two related bugs, both about removal:
 
-**Known limitation, not yet handled:** this only *adds* current children — it doesn't remove a
-child that got moved OUT of a parent (to become top-level, or to nest under a different parent
-instead). Doing that correctly would mean fetching the *old* parent's current SCIM member list and
-diffing it against Keycloak's live subgroups, which isn't implemented. If your use case involves
-groups being restructured/moved between parents (not just nested once and left alone), this is the
-next piece to build — flag it and I'll add the diff-and-remove logic. Also unverified:
-`GroupModel.getSubGroups()`'s exact return type against Keycloak 26.6.4 — if `mvn compile`
-complains here, it's likely just a method signature detail, same pattern as the other SDK-shape
-fixes above.
+1. **User removed from a group was silently skipped entirely.** The top-level
+   `onEvent(AdminEvent...)` had `if (operationType == DELETE) return;` checked *before* looking at
+   `resourceType` at all. That was meant to skip whole-entity deletion (a user or group being
+   deleted outright — correctly handled elsewhere via `UserModel.UserRemovedEvent`/
+   `GroupModel.GroupRemovedEvent`), but it also caught **`GROUP_MEMBERSHIP` DELETE** — a user being
+   removed from a group without the user or group itself being deleted. Fixed by moving the
+   DELETE-skip to only apply once we know we're looking at a plain `users/{id}` or `groups/{id}`
+   path; `GROUP_MEMBERSHIP` and the `groups/{id}/children` path now run through for both CREATE and
+   DELETE operation types.
+
+2. **Un-nesting a child group (moving it away from a parent) wasn't tracked at all** —
+   `syncGroupChildren` previously only ever added current children, with no way to notice one had
+   disappeared (there's no separate event fired on the child itself when it leaves a parent; only
+   the affected parent's `groups/{id}/children` path fires). Fixed by having each parent group
+   record which child IDs it last saw as a Keycloak group attribute
+   (`scim.lastKnownChildGroupIds`), diffing that against the current live subgroups on every sync,
+   and issuing `removeGroupChildMember` for anything that dropped out — using only APIs already
+   confirmed working elsewhere (attribute get/set, PATCH-based add/remove), rather than the
+   unverified SCIM list/filter API used in the 409-reconciliation fix.
+
+## Nested/child groups: create and move now fully supported
+
+(Originally added as an ADD-only fix; the removal/un-nesting gap noted here has since been closed
+— see the "removing a user from a group" section above for the follow-up fix.) Confirmed from real
+logs: moving a group to become a child of another (or creating a new child group) fires
+`resourceType=GROUP`, `resourcePath=groups/{parentId}/children`, `operationType=UPDATE` — a shape
+the original regex (`^groups/([^/]+)$`) never matched, so these events were silently falling
+through unhandled. Added detection for this path plus `syncGroupChildren(...)`, which ensures the
+parent and each current child are synced, adds each new child as a `Group`-typed member on the
+parent's SCIM group (RFC 7643's standard mechanism for representing nested groups), and removes any
+child that's no longer present.
 
 ## Known issue fixed: a lost create response could orphan a user forever
 

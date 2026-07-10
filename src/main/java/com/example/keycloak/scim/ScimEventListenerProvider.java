@@ -81,13 +81,10 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     @Override
     public void onEvent(AdminEvent adminEvent, boolean includeRepresentation) {
-        if (adminEvent.getOperationType() == OperationType.DELETE) {
-            return; // handled by pre-removal model listeners, see the factory
-        }
-
         String realmId = adminEvent.getRealmId();
         String resourcePath = adminEvent.getResourcePath();
         ResourceType resourceType = adminEvent.getResourceType();
+        OperationType operationType = adminEvent.getOperationType();
         if (realmId == null || resourcePath == null || resourceType == null) {
             return;
         }
@@ -95,24 +92,36 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         if (resourceType == ResourceType.USER) {
             Matcher m = USERS_ID.matcher(resourcePath);
             if (m.matches()) {
+                if (operationType == OperationType.DELETE) {
+                    return; // entity deletion — handled by UserModel.UserRemovedEvent, see the factory
+                }
                 dispatchUserSync(realmId, m.group(1));
             }
         } else if (resourceType == ResourceType.GROUP) {
             Matcher m = GROUPS_ID.matcher(resourcePath);
             if (m.matches()) {
+                if (operationType == OperationType.DELETE) {
+                    return; // entity deletion — handled by GroupModel.GroupRemovedEvent, see the factory
+                }
                 dispatchGroupSync(realmId, m.group(1));
             } else {
                 Matcher childrenMatcher = GROUP_CHILDREN.matcher(resourcePath);
                 if (childrenMatcher.matches()) {
+                    // NOTE: do not skip on DELETE here — a child being un-nested/moved away still
+                    // needs to run through syncGroupChildren so it can be removed from this
+                    // parent's SCIM membership. Only whole-entity deletion is handled elsewhere.
                     dispatchGroupChildrenSync(realmId, childrenMatcher.group(1));
                 }
             }
         } else if (resourceType == ResourceType.GROUP_MEMBERSHIP) {
+            // IMPORTANT: this branch must run for BOTH CREATE and DELETE. A user being removed
+            // from a group (without the user or group itself being deleted) fires DELETE here —
+            // it used to be silently skipped by an overly broad top-level DELETE check.
             Matcher m = USER_GROUP_MEMBERSHIP.matcher(resourcePath);
             if (m.matches()) {
                 String userId = m.group(1);
                 String groupId = m.group(2);
-                boolean joined = adminEvent.getOperationType() == OperationType.CREATE;
+                boolean joined = operationType == OperationType.CREATE;
                 dispatchMembershipSync(realmId, userId, groupId, joined);
             }
         }
@@ -244,19 +253,23 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         }
     }
 
+    /** Realm/group attribute recording which Keycloak child-group IDs were last synced as SCIM
+     *  members of this parent — used to detect a child that got un-nested/moved away, since there's
+     *  no separate event fired on the child itself when it leaves a parent (see syncGroupChildren). */
+    private static final String LAST_KNOWN_CHILDREN_ATTR = "scim.lastKnownChildGroupIds";
+
     /**
      * Fires when a group's child-group list changes (creating a child group under a parent, or
-     * moving an existing group to become a child of a different parent). Ensures the parent and
-     * every current child are synced, then ADDs each current child as a Group-typed member on the
-     * parent's SCIM group (RFC 7643 allows "members" entries of type "Group" for nested groups).
+     * moving an existing group to become a child of a different parent, in either direction).
+     * Ensures the parent and every current child are synced, ADDs any newly-appeared child as a
+     * Group-typed member on the parent's SCIM group (RFC 7643 allows "members" entries of type
+     * "Group" for nested groups), and REMOVEs any child that's no longer present.
      *
-     * KNOWN LIMITATION: this only ADDs current children — it does not remove a child that was
-     * moved OUT of this parent to become top-level or to nest under a different parent. Moving a
-     * group between two parents fires this same event for the *new* parent (which this handles),
-     * but making the *old* parent's SCIM record correctly drop the moved-out child would require
-     * fetching the old parent's current SCIM member list and diffing it against Keycloak's live
-     * subgroups, which isn't implemented yet. If that matters for your setup, this is the next
-     * piece to add — flag it and I'll build the diff-and-remove logic.
+     * Removal detection works by diffing the parent's live subgroups against
+     * {@code LAST_KNOWN_CHILDREN_ATTR}, a Keycloak group attribute this method maintains on the
+     * parent recording which child IDs it last saw — there's no separate AdminEvent fired on the
+     * child itself when it's un-nested, only this same "parent's children changed" event on
+     * whichever parent(s) are affected, so this is the only place that can notice a removal.
      */
     private void syncGroupChildren(KeycloakSession s, String realmId, String parentGroupId) {
         RealmModel realm = s.realms().getRealm(realmId);
@@ -272,14 +285,48 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         }
 
         ScimSyncService syncService = ScimClientCache.getOrCreate(realm, serverDefaultConfig);
+        String attr = serverDefaultConfig.overrideFromRealm(realm).externalIdAttribute();
+
+        java.util.Set<String> currentChildIds = parent.getSubGroupsStream()
+                .map(GroupModel::getId)
+                .collect(java.util.stream.Collectors.toSet());
+
+        String lastKnownRaw = parent.getFirstAttribute(LAST_KNOWN_CHILDREN_ATTR);
+        java.util.Set<String> lastKnownChildIds = (lastKnownRaw == null || lastKnownRaw.isBlank())
+                ? java.util.Collections.emptySet()
+                : new java.util.HashSet<>(java.util.Arrays.asList(lastKnownRaw.split(",")));
+
+        // Newly-appeared children: ensure synced, add as Group-typed member.
         parent.getSubGroupsStream().forEach(child -> {
-            String childScimId = syncGroup(s, realmId, child.getId());
-            if (childScimId != null) {
-                syncService.addGroupChildMember(parentScimId, childScimId);
-            } else {
-                LOG.warnf("Skipping nested-group membership, child group %s has no SCIM id", child.getId());
+            if (!lastKnownChildIds.contains(child.getId())) {
+                String childScimId = syncGroup(s, realmId, child.getId());
+                if (childScimId != null) {
+                    syncService.addGroupChildMember(parentScimId, childScimId);
+                } else {
+                    LOG.warnf("Skipping nested-group membership, child group %s has no SCIM id", child.getId());
+                }
             }
         });
+
+        // Children that disappeared since last time: no longer under this parent — remove from
+        // this parent's SCIM membership. The child group entity itself may still exist elsewhere
+        // (just moved), so look it up fresh rather than assuming it was deleted.
+        for (String removedChildId : lastKnownChildIds) {
+            if (!currentChildIds.contains(removedChildId)) {
+                GroupModel removedChild = s.groups().getGroupById(realm, removedChildId);
+                String removedChildScimId = removedChild != null
+                        ? ExternalIdStore.getGroupExternalId(removedChild, attr)
+                        : null;
+                if (removedChildScimId != null) {
+                    syncService.removeGroupChildMember(parentScimId, removedChildScimId);
+                } else {
+                    LOG.warnf("Could not resolve SCIM id for removed child group %s under parent %s; "
+                            + "its stale membership on the SCIM server may need manual cleanup", removedChildId, parentGroupId);
+                }
+            }
+        }
+
+        parent.setSingleAttribute(LAST_KNOWN_CHILDREN_ATTR, String.join(",", currentChildIds));
     }
 
     private void syncMembership(KeycloakSession s, String realmId, String userId, String groupId, boolean joined) {
