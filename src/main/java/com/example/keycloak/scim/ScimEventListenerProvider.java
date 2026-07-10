@@ -272,7 +272,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         }
 
         ScimSyncService syncService = ScimClientCache.getOrCreate(realm, serverDefaultConfig);
-        parent.getSubGroups().forEach(child -> {
+        parent.getSubGroupsStream().forEach(child -> {
             String childScimId = syncGroup(s, realmId, child.getId());
             if (childScimId != null) {
                 syncService.addGroupChildMember(parentScimId, childScimId);
