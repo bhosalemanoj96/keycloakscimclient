@@ -131,6 +131,26 @@ Worth still running once to be sure there's only one version now:
 mvn dependency:tree | findstr scim-sdk
 ```
 
+## Known gap fixed (partially): nested/child groups weren't synced at all
+
+Confirmed from real logs: moving a group to become a child of another (or creating a new child
+group) fires `resourceType=GROUP`, `resourcePath=groups/{parentId}/children`,
+`operationType=UPDATE` — a shape the original regex (`^groups/([^/]+)$`) never matched, so these
+events were silently falling through unhandled. Added detection for this path plus
+`syncGroupChildren(...)`, which ensures the parent and each current child are synced, then adds
+each child as a `Group`-typed member on the parent's SCIM group (RFC 7643's standard mechanism for
+representing nested groups).
+
+**Known limitation, not yet handled:** this only *adds* current children — it doesn't remove a
+child that got moved OUT of a parent (to become top-level, or to nest under a different parent
+instead). Doing that correctly would mean fetching the *old* parent's current SCIM member list and
+diffing it against Keycloak's live subgroups, which isn't implemented. If your use case involves
+groups being restructured/moved between parents (not just nested once and left alone), this is the
+next piece to build — flag it and I'll add the diff-and-remove logic. Also unverified:
+`GroupModel.getSubGroups()`'s exact return type against Keycloak 26.6.4 — if `mvn compile`
+complains here, it's likely just a method signature detail, same pattern as the other SDK-shape
+fixes above.
+
 ## Known issue fixed: a lost create response could orphan a user forever
 
 Diagnosed from a real repeated 409 in testing: `createUser` POSTs, the SCIM server actually creates

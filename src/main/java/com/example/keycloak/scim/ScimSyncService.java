@@ -149,9 +149,18 @@ public class ScimSyncService {
     }
 
     // ---------- Group membership (PATCH) ----------
+    //
+    // SCIM (RFC 7643) allows a Group's "members" array to contain entries of type "Group", not just
+    // "User" — that's the standard way nested/child groups are represented. addMember/removeMember
+    // are generalized to accept the member type so the same mechanism covers both user membership
+    // and nested-group membership.
 
     public boolean addMember(String scimGroupId, String scimUserId) {
-        Member member = Member.builder().value(scimUserId).type("User").build();
+        return addMember(scimGroupId, scimUserId, "User");
+    }
+
+    public boolean addMember(String scimGroupId, String scimMemberId, String memberType) {
+        Member member = Member.builder().value(scimMemberId).type(memberType).build();
         ServerResponse<Group> response = withRetry(() ->
                 scimRequestBuilder.patch(Group.class, EndpointPaths.GROUPS, scimGroupId)
                         .addOperation()
@@ -160,7 +169,7 @@ public class ScimSyncService {
                         .valueNode(member)
                         .build()
                         .sendRequest());
-        return handle(response, "add member " + scimUserId + " to group " + scimGroupId);
+        return handle(response, "add " + memberType + " member " + scimMemberId + " to group " + scimGroupId);
     }
 
     public boolean removeMember(String scimGroupId, String scimUserId) {
@@ -172,6 +181,16 @@ public class ScimSyncService {
                         .build()
                         .sendRequest());
         return handle(response, "remove member " + scimUserId + " from group " + scimGroupId);
+    }
+
+    /** Same as {@link #addMember(String, String)} but for a child group being nested under a parent. */
+    public boolean addGroupChildMember(String parentScimGroupId, String childScimGroupId) {
+        return addMember(parentScimGroupId, childScimGroupId, "Group");
+    }
+
+    /** Same as {@link #removeMember(String, String)} but for un-nesting a child group from a parent. */
+    public boolean removeGroupChildMember(String parentScimGroupId, String childScimGroupId) {
+        return removeMember(parentScimGroupId, childScimGroupId);
     }
 
     // ---------- Plumbing ----------

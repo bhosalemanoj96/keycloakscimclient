@@ -43,6 +43,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     private static final Pattern USERS_ID = Pattern.compile("^users/([^/]+)$");
     private static final Pattern GROUPS_ID = Pattern.compile("^groups/([^/]+)$");
+    private static final Pattern GROUP_CHILDREN = Pattern.compile("^groups/([^/]+)/children$");
     private static final Pattern USER_GROUP_MEMBERSHIP = Pattern.compile("^users/([^/]+)/groups/([^/]+)$");
 
     private final KeycloakSession session;
@@ -100,6 +101,11 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             Matcher m = GROUPS_ID.matcher(resourcePath);
             if (m.matches()) {
                 dispatchGroupSync(realmId, m.group(1));
+            } else {
+                Matcher childrenMatcher = GROUP_CHILDREN.matcher(resourcePath);
+                if (childrenMatcher.matches()) {
+                    dispatchGroupChildrenSync(realmId, childrenMatcher.group(1));
+                }
             }
         } else if (resourceType == ResourceType.GROUP_MEMBERSHIP) {
             Matcher m = USER_GROUP_MEMBERSHIP.matcher(resourcePath);
@@ -160,6 +166,16 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 syncGroup(s, realmId, groupId);
             } catch (Throwable t) {
                 LOG.errorf(t, "Failed syncing group %s to SCIM server", groupId);
+            }
+        })));
+    }
+
+    private void dispatchGroupChildrenSync(String realmId, String parentGroupId) {
+        afterCommit(() -> executor.submit(() -> KeycloakModelUtils.runJobInTransaction(sessionFactory, s -> {
+            try {
+                syncGroupChildren(s, realmId, parentGroupId);
+            } catch (Throwable t) {
+                LOG.errorf(t, "Failed syncing child groups of group %s to SCIM server", parentGroupId);
             }
         })));
     }
@@ -226,6 +242,44 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             syncService.renameGroup(existingScimId, group.getName());
             return existingScimId;
         }
+    }
+
+    /**
+     * Fires when a group's child-group list changes (creating a child group under a parent, or
+     * moving an existing group to become a child of a different parent). Ensures the parent and
+     * every current child are synced, then ADDs each current child as a Group-typed member on the
+     * parent's SCIM group (RFC 7643 allows "members" entries of type "Group" for nested groups).
+     *
+     * KNOWN LIMITATION: this only ADDs current children — it does not remove a child that was
+     * moved OUT of this parent to become top-level or to nest under a different parent. Moving a
+     * group between two parents fires this same event for the *new* parent (which this handles),
+     * but making the *old* parent's SCIM record correctly drop the moved-out child would require
+     * fetching the old parent's current SCIM member list and diffing it against Keycloak's live
+     * subgroups, which isn't implemented yet. If that matters for your setup, this is the next
+     * piece to add — flag it and I'll build the diff-and-remove logic.
+     */
+    private void syncGroupChildren(KeycloakSession s, String realmId, String parentGroupId) {
+        RealmModel realm = s.realms().getRealm(realmId);
+        if (realm == null) return;
+        s.getContext().setRealm(realm);
+        GroupModel parent = s.groups().getGroupById(realm, parentGroupId);
+        if (parent == null) return;
+
+        String parentScimId = syncGroup(s, realmId, parentGroupId);
+        if (parentScimId == null) {
+            LOG.warnf("Skipping child-group sync, parent group %s has no SCIM id", parentGroupId);
+            return;
+        }
+
+        ScimSyncService syncService = ScimClientCache.getOrCreate(realm, serverDefaultConfig);
+        parent.getSubGroups().forEach(child -> {
+            String childScimId = syncGroup(s, realmId, child.getId());
+            if (childScimId != null) {
+                syncService.addGroupChildMember(parentScimId, childScimId);
+            } else {
+                LOG.warnf("Skipping nested-group membership, child group %s has no SCIM id", child.getId());
+            }
+        });
     }
 
     private void syncMembership(KeycloakSession s, String realmId, String userId, String groupId, boolean joined) {
