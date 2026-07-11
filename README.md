@@ -228,6 +228,24 @@ with blank values) — so by the time an admin actually fills in the form and hi
 real edit made through the UI was silently thrown away. Fixed by implementing `onUpdate` with the
 same persistence logic as `onCreate` (see `ScimConfigTab.persist(...)`).
 
+## Known issue fixed: deleting a child group left a stale membership reference on its parent forever
+
+Confirmed from real testing: delete a child group that was previously synced under a parent, and
+the parent's SCIM record kept a permanent stale "Group" member entry pointing at the now-deleted
+child — because by the time `syncGroupChildren`'s async diff logic ran, the child no longer existed
+in Keycloak to look its SCIM id up from (logged as "Could not resolve SCIM id for removed child
+group ... its stale membership may need manual cleanup"). This corrupted tracking state on the
+parent could also interfere with syncing *other* children added afterward. Fixed by cleaning up the
+parent's SCIM membership reference (and the parent's `LAST_KNOWN_CHILDREN_ATTR` tracking) directly
+inside the `GroupModel.GroupRemovedEvent` handler, synchronously, while the about-to-be-deleted
+group's `getParentId()` is still readable — the same technique already used for reading the
+deleted group's own `scimExternalId` before it disappears.
+
+**Caveat:** treating `getParentId() == realm.getId()` as "this is a top-level group, no parent to
+clean up" is an assumption — Keycloak has used different conventions across versions for what a
+top-level group's parent reference actually is. Worth confirming this doesn't skip cleanup for a
+real parent, or misfire for a genuinely top-level group.
+
 ## Known issue fixed: SDK's own error-parser could throw and mask the real failure reason
 
 Confirmed via a real stack trace: `handle()` calls `response.getErrorResponse()` to log a clean

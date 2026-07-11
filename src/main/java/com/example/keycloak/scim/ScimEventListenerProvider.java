@@ -255,8 +255,10 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     /** Realm/group attribute recording which Keycloak child-group IDs were last synced as SCIM
      *  members of this parent — used to detect a child that got un-nested/moved away, since there's
-     *  no separate event fired on the child itself when it leaves a parent (see syncGroupChildren). */
-    private static final String LAST_KNOWN_CHILDREN_ATTR = "scim.lastKnownChildGroupIds";
+     *  no separate event fired on the child itself when it leaves a parent (see syncGroupChildren).
+     *  Package-visible: also updated by ScimEventListenerProviderFactory when a child group is
+     *  deleted outright, so its parent's tracking doesn't go stale. */
+    static final String LAST_KNOWN_CHILDREN_ATTR = "scim.lastKnownChildGroupIds";
 
     /**
      * Fires when a group's child-group list changes (creating a child group under a parent, or

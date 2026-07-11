@@ -82,12 +82,40 @@ public class ScimEventListenerProviderFactory implements EventListenerProviderFa
                 }
             } else if (event instanceof GroupModel.GroupRemovedEvent removedEvent) {
                 RealmModel realm = removedEvent.getRealm();
+                GroupModel removedGroup = removedEvent.getGroup();
                 String attr = serverDefaultConfig.overrideFromRealm(realm).externalIdAttribute();
-                String scimId = ExternalIdStore.getGroupExternalId(removedEvent.getGroup(), attr);
+                String scimId = ExternalIdStore.getGroupExternalId(removedGroup, attr);
+
+                // Also clean up the PARENT's SCIM membership reference to this child, and its
+                // last-known-children tracking, while we still have synchronous access to the live
+                // (pre-removal) group model. Without this, a deleted child leaves a stale "Group"
+                // member entry on its former parent's SCIM record that syncGroupChildren can never
+                // resolve afterward — by the time it runs asynchronously, the child no longer exists
+                // in Keycloak to look its scimExternalId up from, and the parent's tracking attribute
+                // is left pointing at a child ID that will never disappear on its own.
+                String parentId = removedGroup.getParentId();
+                GroupModel parent = (parentId != null && !parentId.isBlank() && !parentId.equals(realm.getId()))
+                        ? removedEvent.getKeycloakSession().groups().getGroupById(realm, parentId)
+                        : null;
+                String parentScimId = parent != null ? ExternalIdStore.getGroupExternalId(parent, attr) : null;
+
+                if (parent != null) {
+                    String raw = parent.getFirstAttribute(ScimEventListenerProvider.LAST_KNOWN_CHILDREN_ATTR);
+                    if (raw != null && !raw.isBlank()) {
+                        java.util.Set<String> ids = new java.util.HashSet<>(java.util.Arrays.asList(raw.split(",")));
+                        ids.remove(removedGroup.getId());
+                        parent.setSingleAttribute(ScimEventListenerProvider.LAST_KNOWN_CHILDREN_ATTR,
+                                String.join(",", ids));
+                    }
+                }
+
                 if (scimId != null) {
                     executor.submit(() -> {
                         try {
                             ScimSyncService syncService = ScimClientCache.getOrCreate(realm, serverDefaultConfig);
+                            if (parentScimId != null) {
+                                syncService.removeGroupChildMember(parentScimId, scimId);
+                            }
                             if (!syncService.deleteGroup(scimId)) {
                                 LOG.errorf("Failed to delete SCIM group %s after Keycloak group removal", scimId);
                             }
