@@ -222,11 +222,20 @@ public class ScimSyncService {
             LOG.debugf("SCIM %s succeeded", action);
             return true;
         }
-        if (response.getErrorResponse() == null) {
-            LOG.errorf("SCIM %s failed (non-SCIM error response): %s", action, response.getResponseBody());
-        } else {
-            LOG.errorf("SCIM %s failed: status=%s detail=%s", action,
-                    response.getHttpStatus(), response.getErrorResponse().getDetail().orElse("n/a"));
+        try {
+            if (response.getErrorResponse() == null) {
+                LOG.errorf("SCIM %s failed (non-SCIM error response): %s", action, response.getResponseBody());
+            } else {
+                LOG.errorf("SCIM %s failed: status=%s detail=%s", action,
+                        response.getHttpStatus(), response.getErrorResponse().getDetail().orElse("n/a"));
+            }
+        } catch (Exception e) {
+            // The SDK's own SCIM-error-response parser can itself throw if the server's error body
+            // doesn't conform to the shape it expects (e.g. a field it expects to be scalar turns
+            // out to be a JSON array) — fall back to the raw status/body rather than losing the
+            // real failure reason behind an unrelated parser exception.
+            LOG.errorf("SCIM %s failed: status=%s (error body could not be parsed as standard SCIM error: %s) rawBody=%s",
+                    action, response.getHttpStatus(), e.getMessage(), response.getResponseBody());
         }
         return false;
     }

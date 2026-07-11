@@ -228,6 +228,18 @@ with blank values) — so by the time an admin actually fills in the form and hi
 real edit made through the UI was silently thrown away. Fixed by implementing `onUpdate` with the
 same persistence logic as `onCreate` (see `ScimConfigTab.persist(...)`).
 
+## Known issue fixed: SDK's own error-parser could throw and mask the real failure reason
+
+Confirmed via a real stack trace: `handle()` calls `response.getErrorResponse()` to log a clean
+error message, but that call itself can throw (`IncompatibleAttributeException: operation not
+possible for array`) if the SCIM server's error response body doesn't conform to the shape the SDK
+expects for a standard SCIM error (this server's custom `BusinessException`-style error bodies seem
+to be the trigger). That exception was propagating out of `handle()` and being logged as if it
+*were* the failure, hiding whatever the server's actual rejection reason was. Fixed by wrapping the
+`getErrorResponse()` call and falling back to the raw HTTP status/response body when the SDK can't
+parse it — so the next time this happens, the log will show the server's real error content instead
+of an unrelated parser exception.
+
 ## Known issue fixed: real errors were being silently swallowed
 
 If you were seeing a job seemingly stop mid-execution with no exception logged anywhere, this was
