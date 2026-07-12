@@ -44,6 +44,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
     private static final Pattern USERS_ID = Pattern.compile("^users/([^/]+)$");
     private static final Pattern GROUPS_ID = Pattern.compile("^groups/([^/]+)$");
     private static final Pattern GROUP_CHILDREN = Pattern.compile("^groups/([^/]+)/children$");
+    private static final Pattern TOP_LEVEL_GROUPS = Pattern.compile("^groups/?$");
     private static final Pattern USER_GROUP_MEMBERSHIP = Pattern.compile("^users/([^/]+)/groups/([^/]+)$");
 
     private final KeycloakSession session;
@@ -111,6 +112,13 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                     // needs to run through syncGroupChildren so it can be removed from this
                     // parent's SCIM membership. Only whole-entity deletion is handled elsewhere.
                     dispatchGroupChildrenSync(realmId, childrenMatcher.group(1));
+                } else if (TOP_LEVEL_GROUPS.matcher(resourcePath).matches()) {
+                    // Confirmed from real testing: moving a group to become top-level fires this
+                    // bare "groups/" path with no group ID at all — unlike moving into a parent,
+                    // which fires groups/{parentId}/children. Since we don't know which group
+                    // changed from this event alone, sweep all top-level groups and reconcile any
+                    // that still remember an old parent (see syncTopLevelGroupReconciliation).
+                    dispatchTopLevelGroupsSync(realmId);
                 }
             }
         } else if (resourceType == ResourceType.GROUP_MEMBERSHIP) {
@@ -189,6 +197,16 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         })));
     }
 
+    private void dispatchTopLevelGroupsSync(String realmId) {
+        afterCommit(() -> executor.submit(() -> KeycloakModelUtils.runJobInTransaction(sessionFactory, s -> {
+            try {
+                syncTopLevelGroupReconciliation(s, realmId);
+            } catch (Throwable t) {
+                LOG.errorf(t, "Failed reconciling top-level groups to SCIM server");
+            }
+        })));
+    }
+
     private void dispatchMembershipSync(String realmId, String userId, String groupId, boolean joined) {
         afterCommit(() -> executor.submit(() -> KeycloakModelUtils.runJobInTransaction(sessionFactory, s -> {
             try {
@@ -260,6 +278,14 @@ public class ScimEventListenerProvider implements EventListenerProvider {
      *  deleted outright, so its parent's tracking doesn't go stale. */
     static final String LAST_KNOWN_CHILDREN_ATTR = "scim.lastKnownChildGroupIds";
 
+    /** Group attribute, stored on the CHILD (not the parent), recording which parent group's
+     *  Keycloak ID it last belonged to. Confirmed from real testing that moving a group between two
+     *  existing parents may only fire an AdminEvent on the NEW parent's /children path, never the
+     *  old one — tracking from the child's side lets old-parent cleanup happen as a side effect of
+     *  processing the new parent's children, regardless of whether the old parent ever gets its own
+     *  event. Blank/absent means "currently top-level, no parent". */
+    static final String LAST_KNOWN_PARENT_ATTR = "scim.lastKnownParentGroupId";
+
     /**
      * Fires when a group's child-group list changes (creating a child group under a parent, or
      * moving an existing group to become a child of a different parent, in either direction).
@@ -267,11 +293,11 @@ public class ScimEventListenerProvider implements EventListenerProvider {
      * Group-typed member on the parent's SCIM group (RFC 7643 allows "members" entries of type
      * "Group" for nested groups), and REMOVEs any child that's no longer present.
      *
-     * Removal detection works by diffing the parent's live subgroups against
-     * {@code LAST_KNOWN_CHILDREN_ATTR}, a Keycloak group attribute this method maintains on the
-     * parent recording which child IDs it last saw — there's no separate AdminEvent fired on the
-     * child itself when it's un-nested, only this same "parent's children changed" event on
-     * whichever parent(s) are affected, so this is the only place that can notice a removal.
+     * Removal detection works two ways: (1) diffing the parent's live subgroups against
+     * {@code LAST_KNOWN_CHILDREN_ATTR}, catching the case where this same parent's own /children
+     * event fires again later; and (2) checking each newly-appeared child's own
+     * {@code LAST_KNOWN_PARENT_ATTR} to catch a direct move between two existing parents even if
+     * Keycloak never fires a separate event for the old parent.
      */
     private void syncGroupChildren(KeycloakSession s, String realmId, String parentGroupId) {
         RealmModel realm = s.realms().getRealm(realmId);
@@ -298,12 +324,27 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 ? java.util.Collections.emptySet()
                 : new java.util.HashSet<>(java.util.Arrays.asList(lastKnownRaw.split(",")));
 
-        // Newly-appeared children: ensure synced, add as Group-typed member.
+        // Newly-appeared children: ensure synced, add as Group-typed member, and — if this child
+        // remembers a DIFFERENT previous parent — clean that old parent up too, right here.
         parent.getSubGroupsStream().forEach(child -> {
             if (!lastKnownChildIds.contains(child.getId())) {
                 String childScimId = syncGroup(s, realmId, child.getId());
                 if (childScimId != null) {
                     syncService.addGroupChildMember(parentScimId, childScimId);
+
+                    String oldParentId = child.getFirstAttribute(LAST_KNOWN_PARENT_ATTR);
+                    if (oldParentId != null && !oldParentId.isBlank() && !oldParentId.equals(parentGroupId)) {
+                        GroupModel oldParent = s.groups().getGroupById(realm, oldParentId);
+                        String oldParentScimId = oldParent != null
+                                ? ExternalIdStore.getGroupExternalId(oldParent, attr) : null;
+                        if (oldParentScimId != null) {
+                            syncService.removeGroupChildMember(oldParentScimId, childScimId);
+                        } else {
+                            LOG.warnf("Child group %s moved from parent %s but that parent has no SCIM id; "
+                                    + "its stale membership may need manual cleanup", child.getId(), oldParentId);
+                        }
+                    }
+                    child.setSingleAttribute(LAST_KNOWN_PARENT_ATTR, parentGroupId);
                 } else {
                     LOG.warnf("Skipping nested-group membership, child group %s has no SCIM id", child.getId());
                 }
@@ -329,6 +370,40 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         }
 
         parent.setSingleAttribute(LAST_KNOWN_CHILDREN_ATTR, String.join(",", currentChildIds));
+    }
+
+    /**
+     * Fires when a group is moved to become top-level (see TOP_LEVEL_GROUPS — Keycloak fires a bare
+     * "groups/" AdminEvent with no group ID for this, unlike moving INTO a parent). Since we don't
+     * know which group changed from the event alone, sweep every top-level group and reconcile any
+     * that still remembers an old parent via LAST_KNOWN_PARENT_ATTR — removing it from that old
+     * parent's SCIM membership and clearing the attribute.
+     */
+    private void syncTopLevelGroupReconciliation(KeycloakSession s, String realmId) {
+        RealmModel realm = s.realms().getRealm(realmId);
+        if (realm == null) return;
+        s.getContext().setRealm(realm);
+
+        ScimSyncService syncService = ScimClientCache.getOrCreate(realm, serverDefaultConfig);
+        String attr = serverDefaultConfig.overrideFromRealm(realm).externalIdAttribute();
+
+        realm.getTopLevelGroupsStream().forEach(group -> {
+            String oldParentId = group.getFirstAttribute(LAST_KNOWN_PARENT_ATTR);
+            if (oldParentId != null && !oldParentId.isBlank()) {
+                String childScimId = syncGroup(s, realmId, group.getId());
+                GroupModel oldParent = s.groups().getGroupById(realm, oldParentId);
+                String oldParentScimId = oldParent != null
+                        ? ExternalIdStore.getGroupExternalId(oldParent, attr) : null;
+
+                if (oldParentScimId != null && childScimId != null) {
+                    syncService.removeGroupChildMember(oldParentScimId, childScimId);
+                } else {
+                    LOG.warnf("Could not fully reconcile group %s becoming top-level "
+                            + "(oldParentScimId=%s, childScimId=%s)", group.getId(), oldParentScimId, childScimId);
+                }
+                group.setSingleAttribute(LAST_KNOWN_PARENT_ATTR, "");
+            }
+        });
     }
 
     private void syncMembership(KeycloakSession s, String realmId, String userId, String groupId, boolean joined) {

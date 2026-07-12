@@ -228,6 +228,28 @@ with blank values) — so by the time an admin actually fills in the form and hi
 real edit made through the UI was silently thrown away. Fixed by implementing `onUpdate` with the
 same persistence logic as `onCreate` (see `ScimConfigTab.persist(...)`).
 
+## Known issue fixed: moving a group to top-level did nothing (different event shape than moving into a parent)
+
+Confirmed from real logs: moving a group *into* a parent fires `groups/{parentId}/children`, but
+moving a group *out* to top-level fires a bare `groups/` path with **no group ID anywhere in it** —
+a shape nothing was matching, so these events were silently ignored. Since that event carries no ID
+to say which group changed, `syncTopLevelGroupReconciliation(...)` instead sweeps every top-level
+group and checks a new group attribute, `LAST_KNOWN_PARENT_ATTR`, which each group now maintains on
+itself recording which parent it last belonged to; anything found still pointing at an old parent
+gets removed from that parent's SCIM membership and the attribute cleared.
+
+This also uncovered a related gap: moving a group directly between two *existing* parents might
+only ever fire an event on the *new* parent, never the old one. `syncGroupChildren` now also checks
+this same child-side `LAST_KNOWN_PARENT_ATTR` whenever it processes a newly-appeared child, so the
+old parent gets cleaned up as a side effect of handling the new parent's event — regardless of
+whether Keycloak ever fires anything for the old parent directly. This complements (doesn't
+replace) the existing parent-side `LAST_KNOWN_CHILDREN_ATTR` diffing, which still catches the case
+where the same parent's own `/children` event fires again later.
+
+**Unverified:** `realm.getTopLevelGroupsStream()` — assumed present on `RealmModel` following the
+same Stream-suffix convention confirmed for `GroupModel.getSubGroupsStream()`, but not specifically
+checked against 26.6.4.
+
 ## Known issue fixed: deleting a child group left a stale membership reference on its parent forever
 
 Confirmed from real testing: delete a child group that was previously synced under a parent, and
