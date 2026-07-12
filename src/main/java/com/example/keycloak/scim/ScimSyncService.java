@@ -2,14 +2,21 @@ package com.example.keycloak.scim;
 
 import com.fasterxml.jackson.databind.node.TextNode;
 import de.captaingoldfish.scim.sdk.client.ScimRequestBuilder;
+import de.captaingoldfish.scim.sdk.client.builder.BulkBuilder;
 import de.captaingoldfish.scim.sdk.client.response.ServerResponse;
 import de.captaingoldfish.scim.sdk.common.constants.EndpointPaths;
+import de.captaingoldfish.scim.sdk.common.constants.enums.HttpMethod;
 import de.captaingoldfish.scim.sdk.common.constants.enums.PatchOp;
 import de.captaingoldfish.scim.sdk.common.resources.Group;
 import de.captaingoldfish.scim.sdk.common.resources.ResourceNode;
 import de.captaingoldfish.scim.sdk.common.resources.User;
 import de.captaingoldfish.scim.sdk.common.resources.multicomplex.Member;
+import de.captaingoldfish.scim.sdk.common.response.BulkResponse;
+import de.captaingoldfish.scim.sdk.common.response.BulkResponseOperation;
 import org.jboss.logging.Logger;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Thin, retrying wrapper around ScimRequestBuilder covering every operation this extension needs:
@@ -85,6 +92,113 @@ public class ScimSyncService {
         }
         return null;
     }
+
+    // ---------- Bulk (RFC 7644 §3.7) ----------
+    //
+    // Genuinely uses the SCIM /Bulk endpoint — a single HTTP request carrying many operations —
+    // rather than one HTTP call per resource, unlike everything else in this class. Used by
+    // ScimBulkSyncService for the initial bootstrap/bulk-load sync.
+    //
+    // Confirmed against SDK javadoc: BulkResponse/BulkResponseOperation really do live in
+    // de.captaingoldfish.scim.sdk.common.response. BulkResponseOperation has no dedicated getId() —
+    // confirmed via its constructor signature (HttpMethod, String, ETag, String, Integer,
+    // ErrorResponse), no id parameter — so the new resource's id is extracted from the trailing
+    // path segment of getLocation() instead.
+    //
+    // Still unverified: the wiki's own bulk example is hand-written for exactly two fixed
+    // operations chained fluently; the loop below reassigning `chain = chain.next()...` for a
+    // dynamic-sized list is my adaptation of that pattern, not something confirmed to compile —
+    // it depends on .next() returning something that still exposes .bulkRequestOperation(...) with
+    // the same fluent shape. Also unverified: HttpMethod's exact package (guessed as
+    // de.captaingoldfish.scim.sdk.common.constants.enums, matching PatchOp's confirmed location).
+    // If either doesn't compile, paste the error.
+
+    /**
+     * Bulk-creates many Users in one SCIM /Bulk request.
+     * @param usersByBulkId map of caller-chosen correlation key (this extension uses the Keycloak
+     *                      user's own ID) to the User resource to create.
+     * @return map of that same correlation key to the SCIM server's assigned id, for every
+     *         operation that succeeded. Keys for failed operations are simply absent.
+     */
+    public Map<String, String> bulkCreateUsers(Map<String, User> usersByBulkId) {
+        return bulkCreate(EndpointPaths.USERS, usersByBulkId, "user");
+    }
+
+    /** Same as {@link #bulkCreateUsers} but for Groups. */
+    public Map<String, String> bulkCreateGroups(Map<String, Group> groupsByBulkId) {
+        return bulkCreate(EndpointPaths.GROUPS, groupsByBulkId, "group");
+    }
+
+    private <T extends ResourceNode> Map<String, String> bulkCreate(String endpointPath,
+                                                                      Map<String, T> resourcesByBulkId,
+                                                                      String actionLabel) {
+        Map<String, String> results = new LinkedHashMap<>();
+        if (resourcesByBulkId.isEmpty()) {
+            return results;
+        }
+
+        try {
+            BulkBuilder bulkBuilder = scimRequestBuilder.bulk();
+
+            // Using var throughout (instead of naming the intermediate builder type explicitly) so
+            // this doesn't depend on guessing that type's name correctly — only on .next(),
+            // .bulkRequestOperation(...), .data(...), .method(...), .bulkId(...), and .sendRequest()
+            // actually existing with these names and a fluent shape consistent across iterations.
+            java.util.Iterator<Map.Entry<String, T>> it = resourcesByBulkId.entrySet().iterator();
+            Map.Entry<String, T> firstEntry = it.next();
+            var chain = bulkBuilder.bulkRequestOperation(endpointPath)
+                    .data(firstEntry.getValue())
+                    .method(HttpMethod.POST)
+                    .bulkId(firstEntry.getKey());
+
+            while (it.hasNext()) {
+                Map.Entry<String, T> entry = it.next();
+                chain = chain.next()
+                        .bulkRequestOperation(endpointPath)
+                        .data(entry.getValue())
+                        .method(HttpMethod.POST)
+                        .bulkId(entry.getKey());
+            }
+
+            ServerResponse<BulkResponse> response = chain.sendRequest();
+
+            if (!response.isSuccess() && response.getResource() == null) {
+                LOG.errorf("Bulk %s create failed (non-SCIM error response): status=%s body=%s",
+                        actionLabel, response.getHttpStatus(), response.getResponseBody());
+                return results;
+            }
+
+            BulkResponse bulkResponse = response.getResource();
+            if (bulkResponse == null) {
+                LOG.errorf("Bulk %s create: no BulkResponse resource on the response despite success=%s",
+                        actionLabel, response.isSuccess());
+                return results;
+            }
+
+            for (BulkResponseOperation op : bulkResponse.getBulkResponseOperations()) {
+                String bulkId = op.getBulkId().orElse(null);
+                if (bulkId == null) continue;
+                if (op.getStatus() >= 200 && op.getStatus() < 300) {
+                    // No dedicated getId() on BulkResponseOperation (confirmed via its constructor
+                    // signature) — extract the new resource's id from the trailing path segment of
+                    // getLocation() instead, e.g. ".../Users/abc-123" -> "abc-123".
+                    op.getLocation().ifPresent(location -> {
+                        String id = location.substring(location.lastIndexOf('/') + 1);
+                        if (!id.isBlank()) {
+                            results.put(bulkId, id);
+                        }
+                    });
+                } else {
+                    LOG.warnf("Bulk %s create: operation with bulkId=%s failed, status=%s",
+                            actionLabel, bulkId, op.getStatus());
+                }
+            }
+        } catch (Exception e) {
+            LOG.errorf(e, "Bulk %s create threw an exception building/sending the request", actionLabel);
+        }
+        return results;
+    }
+
 
     public boolean updateUser(String scimUserId, User scimUser) {
         ServerResponse<User> response = withRetry(() ->

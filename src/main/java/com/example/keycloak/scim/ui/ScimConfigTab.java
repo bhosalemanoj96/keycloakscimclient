@@ -1,6 +1,9 @@
 package com.example.keycloak.scim.ui;
 
+import com.example.keycloak.scim.ScimBulkSyncService;
 import com.example.keycloak.scim.ScimClientCache;
+import com.example.keycloak.scim.ScimProvisioningConfig;
+import org.jboss.logging.Logger;
 import org.keycloak.Config;
 import org.keycloak.component.ComponentModel;
 import org.keycloak.models.KeycloakSession;
@@ -15,6 +18,8 @@ import org.keycloak.services.ui.extend.UiTabProviderFactory;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Adds a "SCIM Provisioning" tab to Realm Settings, so the SCIM base URL / auth mode / credentials
@@ -48,7 +53,11 @@ import java.util.Map;
  */
 public class ScimConfigTab implements UiTabProvider, UiTabProviderFactory<ComponentModel> {
 
+    private static final Logger LOG = Logger.getLogger(ScimConfigTab.class);
     private static final String ATTR_PREFIX = "scim.";
+
+    private ScimProvisioningConfig serverDefaultConfig;
+    private ExecutorService bulkSyncExecutor;
 
     @Override
     public String getId() {
@@ -61,13 +70,24 @@ public class ScimConfigTab implements UiTabProvider, UiTabProviderFactory<Compon
     }
 
     @Override
-    public void init(Config.Scope config) { }
+    public void init(Config.Scope config) {
+        this.serverDefaultConfig = ScimProvisioningConfig.from(config);
+        this.bulkSyncExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "scim-bulk-sync");
+            t.setDaemon(true);
+            return t;
+        });
+    }
 
     @Override
     public void postInit(KeycloakSessionFactory factory) { }
 
     @Override
-    public void close() { }
+    public void close() {
+        if (bulkSyncExecutor != null) {
+            bulkSyncExecutor.shutdown();
+        }
+    }
 
     @Override
     public void onCreate(KeycloakSession session, RealmModel realm, ComponentModel model) {
@@ -121,6 +141,27 @@ public class ScimConfigTab implements UiTabProvider, UiTabProviderFactory<Compon
         // Force the next event for this realm to rebuild its SCIM client with the new settings,
         // rather than keep using a cached client built from the previous config.
         ScimClientCache.invalidate(realmId);
+
+        // Bulk sync trigger: checking this box and saving pushes every current user/group in the
+        // realm to the SCIM server in one go — useful for initial bootstrap and for exercising the
+        // SCIM server's bulk-handling paths directly. Runs on its own dedicated executor so it can't
+        // block the save request or interfere with the regular event-driven sync's thread pool.
+        // NOTE: the checkbox isn't automatically unchecked afterward — the admin console's own
+        // component-persistence layer controls that, not this code — so it may still show checked
+        // (and could re-trigger) on the next unrelated save until manually unchecked.
+        if ("true".equalsIgnoreCase(model.get("triggerFullSync"))) {
+            LOG.infof("Bulk sync requested via SCIM Provisioning tab for realm %s", realmId);
+            bulkSyncExecutor.submit(() -> KeycloakModelUtils.runJobInTransaction(sessionFactory, s -> {
+                try {
+                    RealmModel freshRealm = s.realms().getRealm(realmId);
+                    if (freshRealm != null) {
+                        new ScimBulkSyncService().syncAll(s, freshRealm, serverDefaultConfig);
+                    }
+                } catch (Throwable t) {
+                    LOG.errorf(t, "Bulk sync failed for realm %s", realmId);
+                }
+            }));
+        }
     }
 
     private void setIfPresent(RealmModel realm, ComponentModel model, String field) {
@@ -176,6 +217,17 @@ public class ScimConfigTab implements UiTabProvider, UiTabProviderFactory<Compon
                 .label("External ID attribute name")
                 .helpText("Keycloak user/group attribute used to store the SCIM server's resource ID. Leave blank to use the server default (scimExternalId).")
                 .type(ProviderConfigProperty.STRING_TYPE)
+                .add();
+
+        builder.property()
+                .name("triggerFullSync")
+                .label("Trigger full sync now")
+                .helpText("Check this and Save to push every current user and group in this realm to "
+                        + "the SCIM server in one go. Runs in the background after saving — check the "
+                        + "server log for progress and a summary when it finishes. Uncheck afterward; "
+                        + "it may otherwise re-trigger on the next unrelated save.")
+                .type(ProviderConfigProperty.BOOLEAN_TYPE)
+                .defaultValue("false")
                 .add();
 
         return builder.build();

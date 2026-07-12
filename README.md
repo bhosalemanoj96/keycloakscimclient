@@ -228,6 +228,42 @@ with blank values) — so by the time an admin actually fills in the form and hi
 real edit made through the UI was silently thrown away. Fixed by implementing `onUpdate` with the
 same persistence logic as `onCreate` (see `ScimConfigTab.persist(...)`).
 
+## Bulk/bootstrap sync — now genuinely uses the SCIM Bulk endpoint (RFC 7644 §3.7)
+
+Triggered from the SCIM Provisioning tab: check "Trigger full sync now" and Save. Runs on its own
+dedicated background thread. Progress and a final summary (created/updated/failed counts for
+groups, users, and memberships) are logged at INFO level.
+
+**This now genuinely exercises your SCIM server's `/Bulk` endpoint** for the create phase — all new
+groups go into one bulk request, then all new users into another, via
+`ScimSyncService.bulkCreateGroups`/`bulkCreateUsers` (confirmed against the SDK's real
+`scimRequestBuilder.bulk()` API) — rather than one HTTP call per resource. Renames/updates for
+already-existing entities, and all group-membership linking (nested groups and user members), still
+go through individual calls afterward, once every entity has a real SCIM id to reference.
+
+**Read this before relying on the bulk-specific parts:** the SDK wiki's own bulk example is
+hand-written for exactly two fixed operations chained fluently — it does not show how to build a
+request from a dynamic-sized list, which is what `ScimSyncService.bulkCreate(...)` actually needs
+to do. The loop-based adaptation there, plus the package names guessed for `HttpMethod`,
+`BulkResponse`, and `BulkResponseOperation`, are meaningfully less certain than the rest of this
+project's fixes — expect this specific piece may need more than one round of compiler-guided
+correction, unlike the single-line fixes elsewhere. If `bulkCreateGroups`/`bulkCreateUsers` fail to
+compile or behave unexpectedly at runtime, that's the first place to look; nothing else in this
+extension depends on them (the event-driven incremental sync path is entirely separate and
+unaffected either way).
+
+**Other caveats:**
+- The checkbox doesn't automatically uncheck itself afterward — uncheck it manually, or it may
+  re-trigger on your next unrelated settings save.
+- No in-browser progress feedback, only server logs.
+- Whether the bulk response includes each created resource's `id` field (used to correlate results
+  back to Keycloak entities via `bulkId`) versus requiring the server's optional "return full
+  resource" feature is something worth confirming against your SCIM server's actual `BulkConfig` —
+  per the SDK docs, `id`/`bulkId`/`status`/`location` are core fields always present regardless, but
+  this is still worth a real end-to-end check.
+- For a large realm, this is a genuine, meaningful load test of your SCIM server's bulk-handling
+  capacity — which is presumably exactly what you want it for.
+
 ## Known issue fixed: delete-path SCIM calls used a RealmModel across a closed transaction
 
 Confirmed via stack trace (`GenericJDBCException: Enlisted connection used without active
