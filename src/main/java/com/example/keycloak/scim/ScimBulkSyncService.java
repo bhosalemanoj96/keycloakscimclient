@@ -51,6 +51,7 @@ public class ScimBulkSyncService {
     private static final Logger LOG = Logger.getLogger(ScimBulkSyncService.class);
 
     public void syncAll(KeycloakSession s, RealmModel realm, ScimProvisioningConfig serverDefaultConfig) {
+        s.getContext().setRealm(realm); // required by some internal providers (e.g. Organizations) — same fix as ScimEventListenerProvider
         ScimSyncService syncService = ScimClientCache.getOrCreate(realm, serverDefaultConfig);
         String attr = serverDefaultConfig.overrideFromRealm(realm).externalIdAttribute();
 
