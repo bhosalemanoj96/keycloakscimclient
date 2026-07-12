@@ -264,6 +264,26 @@ unaffected either way).
 - For a large realm, this is a genuine, meaningful load test of your SCIM server's bulk-handling
   capacity — which is presumably exactly what you want it for.
 
+## UI simplified: Bearer-only, no per-realm auth-mode/external-ID-attribute fields
+
+The SCIM Provisioning tab now only exposes **SCIM base URL**, **Bearer token**, and **Trigger full
+sync now**. Auth mode, Basic auth username/password, and the external-ID attribute name are no
+longer configurable per realm through the UI — Bearer is now the assumed default auth mode
+everywhere (server-level default changed from `NONE` to `BEARER` in `ScimProvisioningConfig`), and
+the external-ID attribute always uses the server-wide default (`scimExternalId` unless overridden
+via `keycloak.conf`/env var).
+
+`ScimProvisioningConfig.overrideFromRealm(...)` still technically checks for `scim.authMode`,
+`scim.basicUsername`, `scim.basicPassword`, and `scim.externalIdAttribute` realm attributes — those
+code paths were left in place rather than removed, since they're harmless (nothing ever sets those
+attributes now that the UI doesn't expose them, so they simply always fall through to the server
+default) and it costs nothing to leave the flexibility there for anyone setting a realm attribute
+directly via the Admin REST API instead of this tab.
+
+If you need Basic auth or a non-default external-ID attribute for a specific realm, set it at the
+server level via `keycloak.conf`/`KC_SPI_*` env vars (see the Configure section above) — that still
+works exactly as before, it's just no longer editable per-realm from the console.
+
 ## Known issue fixed: delete-path SCIM calls used a RealmModel across a closed transaction
 
 Confirmed via stack trace (`GenericJDBCException: Enlisted connection used without active

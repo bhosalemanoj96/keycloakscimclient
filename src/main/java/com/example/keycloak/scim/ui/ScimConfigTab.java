@@ -121,11 +121,7 @@ public class ScimConfigTab implements UiTabProvider, UiTabProviderFactory<Compon
             if (realm == null) return;
 
             setIfPresent(realm, model, "baseUrl");
-            setIfPresent(realm, model, "authMode");
-            setIfPresent(realm, model, "basicUsername");
-            setIfPresent(realm, model, "basicPassword");
             setIfPresent(realm, model, "bearerToken");
-            setIfPresent(realm, model, "externalIdAttribute");
         });
 
         // Confirm the write actually landed in the DB (read back via a second, fresh job) rather
@@ -183,40 +179,10 @@ public class ScimConfigTab implements UiTabProvider, UiTabProviderFactory<Compon
                 .add();
 
         builder.property()
-                .name("authMode")
-                .label("Auth mode")
-                .helpText("How this realm authenticates to the SCIM server")
-                .type(ProviderConfigProperty.LIST_TYPE)
-                .options("NONE", "BASIC", "BEARER")
-                .defaultValue("NONE")
-                .add();
-
-        builder.property()
-                .name("basicUsername")
-                .label("Basic auth username")
-                .helpText("Only used when auth mode is BASIC")
-                .type(ProviderConfigProperty.STRING_TYPE)
-                .add();
-
-        builder.property()
-                .name("basicPassword")
-                .label("Basic auth password")
-                .helpText("Only used when auth mode is BASIC")
-                .type(ProviderConfigProperty.PASSWORD)
-                .add();
-
-        builder.property()
                 .name("bearerToken")
                 .label("Bearer token")
-                .helpText("Only used when auth mode is BEARER")
+                .helpText("Token used to authenticate to the SCIM server (Bearer auth is the only mode this tab configures).")
                 .type(ProviderConfigProperty.PASSWORD)
-                .add();
-
-        builder.property()
-                .name("externalIdAttribute")
-                .label("External ID attribute name")
-                .helpText("Keycloak user/group attribute used to store the SCIM server's resource ID. Leave blank to use the server default (scimExternalId).")
-                .type(ProviderConfigProperty.STRING_TYPE)
                 .add();
 
         builder.property()

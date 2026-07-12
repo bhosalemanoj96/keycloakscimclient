@@ -29,7 +29,7 @@ public record ScimProvisioningConfig(
     public static ScimProvisioningConfig from(Config.Scope scope) {
         String baseUrl = firstNonNull(scope.get("scim-base-url"), System.getenv("SCIM_BASE_URL"));
         AuthMode authMode = AuthMode.valueOf(
-                firstNonNull(scope.get("auth-mode"), System.getenv("SCIM_AUTH_MODE"), "NONE").toUpperCase());
+                firstNonNull(scope.get("auth-mode"), System.getenv("SCIM_AUTH_MODE"), "BEARER").toUpperCase());
         String basicUsername = firstNonNull(scope.get("basic-username"), System.getenv("SCIM_BASIC_USERNAME"));
         String basicPassword = firstNonNull(scope.get("basic-password"), System.getenv("SCIM_BASIC_PASSWORD"));
         String bearerToken = firstNonNull(scope.get("bearer-token"), System.getenv("SCIM_BEARER_TOKEN"));
