@@ -39,10 +39,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  * tightly coupled to the event-dispatch/diffing model (LAST_KNOWN_CHILDREN_ATTR,
  * LAST_KNOWN_PARENT_ATTR, transaction-boundary handling) built up across many incremental fixes.
  *
- * UNVERIFIED, same caveat pattern as elsewhere: RealmModel.getTopLevelGroupsStream(),
- * UserProvider.getUsersStream(realm), UserProvider.getGroupMembersStream(realm, group). The bulk
- * create methods this delegates to (ScimSyncService.bulkCreateGroups/bulkCreateUsers) carry
- * additional, higher-than-usual uncertainty of their own — see the comments there.
+ * UNVERIFIED: RealmModel.getTopLevelGroupsStream() (also used and flagged elsewhere), and
+ * UserProvider.getGroupMembersStream(realm, group). getUsersStream(realm) was confirmed via
+ * Keycloak's own javadocs to no longer exist in recent versions — fixed to use
+ * searchForUserStream(realm, Map.of()) instead. The bulk create methods this delegates to
+ * (ScimSyncService.bulkCreateGroups/bulkCreateUsers) carry additional, higher-than-usual
+ * uncertainty of their own — see the comments there.
  */
 public class ScimBulkSyncService {
 
@@ -96,7 +98,7 @@ public class ScimBulkSyncService {
 
         // ---------- Stage 2: users ----------
         List<UserModel> allUsers = new ArrayList<>();
-        s.users().getUsersStream(realm).forEach(allUsers::add);
+        s.users().searchForUserStream(realm, java.util.Map.of()).forEach(allUsers::add);
 
         Map<String, User> newUsersByBulkId = new LinkedHashMap<>();
         for (UserModel u : allUsers) {
