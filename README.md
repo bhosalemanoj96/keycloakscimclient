@@ -228,6 +228,26 @@ with blank values) — so by the time an admin actually fills in the form and hi
 real edit made through the UI was silently thrown away. Fixed by implementing `onUpdate` with the
 same persistence logic as `onCreate` (see `ScimConfigTab.persist(...)`).
 
+## Known issue fixed: delete-path SCIM calls used a RealmModel across a closed transaction
+
+Confirmed via stack trace (`GenericJDBCException: Enlisted connection used without active
+transaction`, surfacing through `ScimClientCache.getOrCreate` → `realm.getId()`): the factory's
+`UserModel.UserRemovedEvent`/`GroupModel.GroupRemovedEvent` handlers captured the live `RealmModel`
+from the original event and then used it *inside* `executor.submit(...)` — on a different thread,
+after the original request's transaction had already ended. This is the exact same class of bug
+fixed earlier for the AdminEvent-driven create/update dispatch paths (see "user/group lookup
+returning null in the async job" above), just never carried over to the model-event-driven delete
+path. Likely also explains the cascading, unrelated-looking errors seen alongside it (e.g. the
+Keycloak-side group deletion itself failing, `ResultSet is closed`) — a connection used outside its
+transaction can corrupt the request's session state for whatever runs afterward, not just the one
+bad call. Fixed by capturing only String IDs across the thread boundary and reopening a fresh
+session via `KeycloakModelUtils.runJobInTransaction` inside the async job, exactly like every other
+dispatch path already does.
+
+**If you hit corrupted-looking cascading errors from a build before this fix, restart the Keycloak
+process fully (stop and restart `kc.bat`, not just redeploy the jar) rather than continuing against
+whatever state that request left the session/dev-database in.**
+
 ## Known issue fixed: moving a group to top-level did nothing (different event shape than moving into a parent)
 
 Confirmed from real logs: moving a group *into* a parent fires `groups/{parentId}/children`, but

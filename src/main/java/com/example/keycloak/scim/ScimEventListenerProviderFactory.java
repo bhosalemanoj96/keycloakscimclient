@@ -10,6 +10,7 @@ import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.models.utils.KeycloakModelUtils;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -66,23 +67,34 @@ public class ScimEventListenerProviderFactory implements EventListenerProviderFa
         factory.register(event -> {
             if (event instanceof UserModel.UserRemovedEvent removedEvent) {
                 RealmModel realm = removedEvent.getRealm();
+                String realmId = realm.getId();
                 String attr = serverDefaultConfig.overrideFromRealm(realm).externalIdAttribute();
                 String scimId = ExternalIdStore.getUserExternalId(removedEvent.getUser(), attr);
                 if (scimId != null) {
-                    executor.submit(() -> {
+                    // IMPORTANT: only String IDs cross the thread boundary here, never the live
+                    // `realm`/model objects — those are bound to this event's (about to end)
+                    // transaction. Using them from the background executor throws "Enlisted
+                    // connection used without active transaction" (confirmed the hard way). A fresh
+                    // session/transaction is opened inside the job instead, same pattern as every
+                    // other async dispatch in ScimEventListenerProvider.
+                    executor.submit(() -> KeycloakModelUtils.runJobInTransaction(factory, s -> {
                         try {
-                            ScimSyncService syncService = ScimClientCache.getOrCreate(realm, serverDefaultConfig);
+                            RealmModel freshRealm = s.realms().getRealm(realmId);
+                            if (freshRealm == null) return;
+                            ScimSyncService syncService = ScimClientCache.getOrCreate(freshRealm, serverDefaultConfig);
                             if (!syncService.deleteUser(scimId)) {
                                 LOG.errorf("Failed to delete SCIM user %s after Keycloak user removal", scimId);
                             }
                         } catch (Throwable t) {
                             LOG.errorf(t, "Failed to delete SCIM user %s after Keycloak user removal", scimId);
                         }
-                    });
+                    }));
                 }
             } else if (event instanceof GroupModel.GroupRemovedEvent removedEvent) {
                 RealmModel realm = removedEvent.getRealm();
+                String realmId = realm.getId();
                 GroupModel removedGroup = removedEvent.getGroup();
+                String removedGroupId = removedGroup.getId();
                 String attr = serverDefaultConfig.overrideFromRealm(realm).externalIdAttribute();
                 String scimId = ExternalIdStore.getGroupExternalId(removedGroup, attr);
 
@@ -92,7 +104,9 @@ public class ScimEventListenerProviderFactory implements EventListenerProviderFa
                 // member entry on its former parent's SCIM record that syncGroupChildren can never
                 // resolve afterward — by the time it runs asynchronously, the child no longer exists
                 // in Keycloak to look its scimExternalId up from, and the parent's tracking attribute
-                // is left pointing at a child ID that will never disappear on its own.
+                // is left pointing at a child ID that will never disappear on its own. This part is
+                // safe to do synchronously/in-line — it's still the same live transaction, only the
+                // async SCIM HTTP call below needs its own fresh session.
                 String parentId = removedGroup.getParentId();
                 GroupModel parent = (parentId != null && !parentId.isBlank() && !parentId.equals(realm.getId()))
                         ? removedEvent.getKeycloakSession().groups().getGroupById(realm, parentId)
@@ -103,16 +117,18 @@ public class ScimEventListenerProviderFactory implements EventListenerProviderFa
                     String raw = parent.getFirstAttribute(ScimEventListenerProvider.LAST_KNOWN_CHILDREN_ATTR);
                     if (raw != null && !raw.isBlank()) {
                         java.util.Set<String> ids = new java.util.HashSet<>(java.util.Arrays.asList(raw.split(",")));
-                        ids.remove(removedGroup.getId());
+                        ids.remove(removedGroupId);
                         parent.setSingleAttribute(ScimEventListenerProvider.LAST_KNOWN_CHILDREN_ATTR,
                                 String.join(",", ids));
                     }
                 }
 
                 if (scimId != null) {
-                    executor.submit(() -> {
+                    executor.submit(() -> KeycloakModelUtils.runJobInTransaction(factory, s -> {
                         try {
-                            ScimSyncService syncService = ScimClientCache.getOrCreate(realm, serverDefaultConfig);
+                            RealmModel freshRealm = s.realms().getRealm(realmId);
+                            if (freshRealm == null) return;
+                            ScimSyncService syncService = ScimClientCache.getOrCreate(freshRealm, serverDefaultConfig);
                             if (parentScimId != null) {
                                 syncService.removeGroupChildMember(parentScimId, scimId);
                             }
@@ -122,7 +138,7 @@ public class ScimEventListenerProviderFactory implements EventListenerProviderFa
                         } catch (Throwable t) {
                             LOG.errorf(t, "Failed to delete SCIM group %s after Keycloak group removal", scimId);
                         }
-                    });
+                    }));
                 }
             }
         });
